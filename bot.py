@@ -1,40 +1,25 @@
-import asyncio
-import logging
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from aiogram.utils import executor
+import asyncio
 
-# Configuración
-TOKEN = "7742088459:AAEhHFvSjnxZkIsLi746Kv-XmTOy06y6DHU"  # Reemplázalo con el token de tu bot
-ADMIN_ID = 6181290784 # Tu ID de usuario en Telegram
+# 🔑 Configuración del bot
+TOKEN = "7742088459:AAEhHFvSjnxZkIsLi746Kv-XmTOy06y6DHU"
+ADMIN_ID = 6181290784  # Tu ID de Telegram
 
-# Inicializar bot y dispatcher
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
 
-# Comando /start
-@dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer("Hola, envíame cualquier pregunta y la haré llegar de forma anónima.")
+# 📩 Manejar mensajes de usuarios
+@dp.message_handler()
+async def recibir_pregunta(message: types.Message):
+    if message.chat.type == "private":  # Asegura que solo reciba en chats privados
+        pregunta = message.text
+        await bot.send_message(ADMIN_ID, f"📩 **Nueva Pregunta Anónima:**\n{pregunta}")
+        await message.reply("✅ Tu pregunta ha sido enviada de forma anónima.")
 
-# Captura cualquier mensaje y lo reenvía al admin
-@dp.message()
-async def receive_question(message: Message):
-    user_id = message.from_user.id
-    question = message.text
-
-    # Enviar pregunta al administrador
-    admin_message = f"📩 Nueva pregunta anónima:\n\n{question}"
-    await bot.send_message(ADMIN_ID, admin_message)
-
-    # Responder al usuario confirmando la recepción
-    await message.answer("✅ Tu pregunta ha sido enviada de forma anónima.")
-
-# Iniciar el bot
+# 🔄 Iniciar el bot
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    await dp.start_polling(bot)
+    await dp.start_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
