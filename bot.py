@@ -6,8 +6,8 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 
 # Configuración
-TOKEN = "TU_TOKEN_AQUI"  # Reemplázalo con el token de tu bot
-ADMIN_ID = TU_ID_AQUI  # Tu ID de usuario en Telegram
+TOKEN = "7742088459:AAEhHFvSjnxZkIsLi746Kv-XmTOy06y6DHU"  # Reemplázalo con el token de tu bot
+ADMIN_ID = 6181290784 # Tu ID de usuario en Telegram
 
 # Inicializar bot y dispatcher
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
