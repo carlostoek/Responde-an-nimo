@@ -10,7 +10,7 @@ ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # Obtén el ID del administ
 
 # 🚀 Configurar el bot y el Dispatcher
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)  # Aquí pasamos el bot al Dispatcher
 
 # 💬 Crear un sistema de datos para almacenar la pregunta y el ID del usuario
 question_data = {}
@@ -46,7 +46,7 @@ async def responder_pregunta(callback_query: CallbackQuery):
 # 🔄 Iniciar el bot
 async def main():
     logging.basicConfig(level=logging.INFO)
-    await dp.start_polling(bot)
+    await dp.start_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
