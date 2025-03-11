@@ -3,7 +3,7 @@ from telegram.ext import Application, MessageHandler, filters
 import os
 
 # Obtén los valores desde las variables de entorno (Railway)
-TOKEN = os.getenv("7742088459:AAEhHFvSjnxZkIsLi746Kv-XmTOy06y6DHU")
+TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # Usa un valor por defecto si la variable no está definida
 
 # Inicializa la aplicación de Telegram
