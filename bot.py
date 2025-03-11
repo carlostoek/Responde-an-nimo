@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 pregunta_mapping = {}
 
 # Handler para recibir preguntas de usuarios (excluyendo al admin)
-@dp.message_handler(lambda message: message.chat.type == "private" and message.from_user.id != ADMIN_ID)
+@dp.message_handler(lambda message: message.chat.type == "private" and message.from_user.id != ADMIN_ID and message.text != "/start")
 async def recibir_pregunta(message: Message):
     pregunta = message.text
     # Enviar la pregunta al administrador y obtener el mensaje enviado
