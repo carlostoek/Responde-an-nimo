@@ -4,7 +4,7 @@ import os
 
 # Obtén los valores desde las variables de entorno (Railway)
 TOKEN = os.getenv("7742088459:AAEhHFvSjnxZkIsLi746Kv-XmTOy06y6DHU")
-ADMIN_ID = int(os.getenv("6181290784"))  # ID del administrador
+ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # Usa un valor por defecto si la variable no está definida
 
 # Inicializa la aplicación de Telegram
 app = Application.builder().token(TOKEN).build()
