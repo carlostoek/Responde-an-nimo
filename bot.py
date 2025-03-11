@@ -16,7 +16,7 @@ dp = Dispatcher(bot)  # Aquí pasamos el bot al Dispatcher
 question_data = {}
 
 # 📩 Manejar mensajes de usuarios
-@dp.message()
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def recibir_pregunta(message: Message):
     if message.chat.type == "private":  # Asegura que solo reciba en chats privados
         pregunta = message.text
