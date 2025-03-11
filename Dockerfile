@@ -1,25 +1,14 @@
-# Usa una imagen oficial de Python como base
-FROM python:3.11-slim  
+# Usa una imagen oficial de Python
+FROM python:3.10
 
-# Establecer el directorio de trabajo dentro del contenedor
-WORKDIR /app  
+# Establece el directorio de trabajo dentro del contenedor
+WORKDIR /app
 
-# Instalar dependencias del sistema necesarias
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    python3-dev \
-    libssl-dev \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*  
+# Copia los archivos del proyecto al contenedor
+COPY bot.py requirements.txt ./
 
-# Copiar archivos del proyecto al contenedor
-COPY . /app  
-
-# Instalar dependencias de Python
-RUN pip install --no-cache-dir -r requirements.txt  
-
-# Exponer el puerto (si fuera necesario)
-EXPOSE 8080  
+# Instala las dependencias
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Comando para ejecutar el bot
 CMD ["python", "bot.py"]
