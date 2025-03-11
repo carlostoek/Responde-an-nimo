@@ -19,11 +19,12 @@ async def start(message: Message):
 
 @dp.message_handler()
 async def recibir_pregunta(message: Message):
-    if message.chat.type == "private":  # Asegura que solo reciba en chats privados
+    # Asegura que solo reciba en chats privados y no sea un mensaje del administrador
+    if message.chat.type == "private" and message.from_user.id != ADMIN_ID:
         pregunta = message.text
 
         # Enviar la pregunta al administrador
-        pregunta_enviada = await bot.send_message(ADMIN_ID, f"📩 Nueva Pregunta Anónima:\n{pregunta}")
+        pregunta_enviada = await bot.send_message(ADMIN_ID, f"📩 Nueva Pregunta Anónima:\n{pregunta}", reply_markup=types.ReplyKeyboardRemove())
 
         # Guardar el ID del mensaje para poder usarlo más tarde
         # Esto es necesario para que el bot sepa a qué pregunta está respondiendo el administrador
@@ -31,14 +32,18 @@ async def recibir_pregunta(message: Message):
 
         # Agregar la información al mensaje del usuario
         await message.reply("✅ Tu pregunta ha sido enviada de forma anónima. El administrador responderá pronto.")
+    elif message.from_user.id == ADMIN_ID:
+        # Evitar que el administrador envíe mensajes malinterpretados como preguntas anónimas
+        return  # No hacer nada si el mensaje es del administrador
 
 # 🚀 Función para manejar la respuesta del administrador
-@dp.message_handler(lambda message: message.reply_to_message and message.reply_to_message.from_user.id == ADMIN_ID)
+@dp.message_handler(lambda message: message.reply_to_message and message.reply_to_message.from_user.id != ADMIN_ID)
 async def responder_pregunta(message: Message):
     # Verificamos que el mensaje sea una respuesta a una pregunta enviada por el bot al administrador
     if message.reply_to_message:
         original_message = message.reply_to_message
         if original_message.text:
+            # Obtenemos el ID del usuario que hizo la pregunta
             user_id = original_message.forward_from.id  # ID del usuario que hizo la pregunta
             pregunta = original_message.text
 
