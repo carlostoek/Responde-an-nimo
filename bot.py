@@ -63,7 +63,7 @@ async def recibir_pregunta(message: Message):
         await bot.edit_message_text(
              chat_id=ADMIN_ID,
              message_id=admin_msg_id,
-             text=f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*ID Mensaje Bot (para revelar identidad):* `{admin_msg_id}`\n\nPara responder, toca la opción de abajo. ¡Gracias! 👇",
+             text=f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*ID Mensaje Bot:* `{admin_msg_id}`\n\nPara responder, toca la opción de abajo. ¡Gracias! 👇",
              parse_mode='Markdown'
         )
 
