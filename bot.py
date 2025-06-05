@@ -1,192 +1,267 @@
 import asyncio
 import logging
 import os
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.utils import executor
-from aiogram.utils.exceptions import ChatNotFound # Importar excepción específica
+import csv
+import io
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
+from sqlalchemy import Column, Integer, String, JSON, select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Obtén los valores desde las variables de entorno
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
-# >>> Variable de entorno para el ID del canal VIP <<<
-CHANNEL_ID = int(os.getenv("CHANNEL_ID")) # Asegúrate de que esta variable esté configurada en Railway
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
-
+# Configuración de logging
 logging.basicConfig(level=logging.INFO)
 
-# Diccionario para mapear el ID del mensaje enviado al admin con el ID del usuario que hizo la pregunta
-# {admin_msg_id: user_id}
-pregunta_mapping = {}
+# Cargar variables de entorno
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
 
-# Handler para recibir preguntas de usuarios (excluyendo al admin, el comando /start y otros comandos)
-@dp.message_handler(lambda message: message.chat.type == "private" and message.from_user.id != ADMIN_ID and message.text != "/start" and not message.text.startswith('/'))
-async def recibir_pregunta(message: Message):
-    user_id = message.from_user.id
-    channel_id = CHANNEL_ID
+# Inicializar bot y dispatcher
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
 
-    # --- Paso 1: Verificar Membresía ---
-    try:
-        chat_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-        status = chat_member.status
+# Base de datos (SQLAlchemy)
+Base = declarative_base()
 
-        if status not in ['creator', 'administrator', 'member']:
-            await message.reply("⛔️ Lo siento, no estás registrado para usar este bot.")
-            return # Salir del handler si no es miembro
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True)
+    username = Column(String, nullable=True)
+    points = Column(Integer, default=0)
+    level = Column(Integer, default=1)
+    achievements = Column(JSON, default=[])
+    completed_missions = Column(JSON, default=[])
 
-    except ChatNotFound:
-        logging.error(f"El bot no puede encontrar el canal con ID {channel_id}. ¿Está configurado correctamente y el bot es miembro?")
-        await message.reply("❌ Ha ocurrido un error interno al verificar el canal. Por favor, informa al administrador.")
-        return # Salir si no se encuentra el canal
+class Mission(Base):
+    __tablename__ = "missions"
+    id = Column(Integer, primary_key=True)
+    title = Column(String)
+    description = Column(String)
+    points = Column(Integer)
+    type = Column(String)
+    active = Column(Integer, default=1)
 
-    except Exception as e:
-        # Capturar cualquier otro error durante la verificación de membresía
-        logging.error(f"Error inesperado al verificar membresía del usuario {user_id}: {e}")
-        await message.reply("❌ Ha ocurrido un error al verificar tu estado. Por favor, intenta más tarde.")
-        return # Salir si ocurre otro error en la verificación
+class Reward(Base):
+    __tablename__ = "rewards"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    description = Column(String)
+    cost = Column(Integer)
+    stock = Column(Integer, default=1)
 
+# Configuración de la base de datos
+engine = create_async_engine(DATABASE_URL, echo=True)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    # --- Paso 2: Si es miembro, enviar mensaje al admin ---
-    # Este bloque solo se ejecuta si la verificación de membresía fue exitosa
-    try:
-        pregunta = message.text
-        sent_message = await bot.send_message(
-            ADMIN_ID,
-            f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*Procesando ID...*" # Enviamos un mensaje inicial sin el ID definitivo
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # Crear misiones y recompensas iniciales
+    async with async_session() as session:
+        missions = [
+            Mission(title="Trivia Diaria", description="Responde la trivia del día", points=10, type="daily"),
+            Mission(title="Post Destacado", description="Clic en el post", points=5, type="daily")
+        ]
+        rewards = [
+            Reward(name="Sticker Exclusivo", description="Un sticker único", cost=20, stock=10),
+            Reward(name="Rol VIP", description="Acceso a canal VIP", cost=50, stock=5)
+        ]
+        for mission in missions:
+            existing = await session.execute(select(Mission).filter_by(title=mission.title))
+            if not existing.scalars().first():
+                session.add(mission)
+        for reward in rewards:
+            existing = await session.execute(select(Reward).filter_by(name=reward.name))
+            if not existing.scalars().first():
+                session.add(reward)
+        await session.commit()
+
+async def get_db():
+    async with async_session() as session:
+        yield session
+
+# Lógica de gamificación
+async def award_points(user: User, points: int, session: AsyncSession):
+    user.points += points
+    await session.commit()
+
+async def check_level_up(user: User, session: AsyncSession):
+    level_thresholds = {2: 10, 3: 25, 4: 50, 5: 100}
+    for level, points_needed in level_thresholds.items():
+        if user.points >= points_needed and user.level < level:
+            user.level = level
+            await award_achievement(user, f"Nivel {level} Alcanzado", session)
+            await session.commit()
+            return True
+    return False
+
+async def award_achievement(user: User, achievement: str, session: AsyncSession):
+    if achievement not in user.achievements:
+        user.achievements.append(achievement)
+        await session.commit()
+        return True
+    return False
+
+# Menú fijo
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Perfil"), KeyboardButton(text="Misiones")],
+        [KeyboardButton(text="Tienda"), KeyboardButton(text="Ranking")]
+    ],
+    resize_keyboard=True
+)
+
+# Handlers
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    async for session in get_db():
+        user = await session.get(User, message.from_user.id)
+        if not user:
+            user = User(telegram_id=message.from_user.id, username=message.from_user.username)
+            session.add(user)
+            await session.commit()
+        await message.answer(
+            "¡Bienvenido al bot gamificado! 🎮\nUsa el menú para navegar.",
+            reply_markup=main_menu
         )
-        # Una vez enviado, obtenemos su ID
-        admin_msg_id = sent_message.message_id
 
-        # Ahora editamos el mensaje para incluir su propio ID (el ID del mensaje que el bot envió al admin)
-        await bot.edit_message_text(
-             chat_id=ADMIN_ID,
-             message_id=admin_msg_id,
-             text=f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*ID Mensaje Bot:* `{admin_msg_id}`\n\nPara responder, toca la opción de abajo. ¡Gracias! 👇",
-             parse_mode='Markdown'
-        )
-
-        # Almacenar en el diccionario {ID_mensaje_bot_a_admin : ID_usuario_original}
-        pregunta_mapping[admin_msg_id] = user_id
-
-
-        # Confirmar al usuario
-        await message.reply("✅ ¡Tu pregunta ha sido enviada de forma anónima! El administrador te responderá pronto. 🙏")
-
-    except Exception as e:
-        # Capturar errores durante el envío o edición del mensaje al admin o al actualizar el mapping
-        # En este punto, la membresía ya fue verificada.
-        logging.error(f"Error al enviar/editar mensaje al admin o actualizar mapping para user {user_id}: {e}")
-        await message.reply("❌ Ha ocurrido un error al procesar o enviar tu pregunta. Por favor, informa al administrador.")
-        # No salimos con return aquí para que el primer reply al usuario (si se ejecutó antes del error) no se pierda,
-        # aunque si el error ocurre *antes* del primer reply, el usuario podría no recibir confirmación ni error.
-        # La confirmación al usuario está ahora DESPUÉS del envío y edición al admin, así que si falla antes, no la recibe.
-        # Esto es mejor: solo confirma si la operación al admin fue exitosa.
-
-
-# Handler para que el administrador responda (usando la función de "responder" de Telegram)
-# No necesita cambios
-@dp.message_handler(lambda message: message.chat.type == "private"
-                                  and message.from_user.id == ADMIN_ID
-                                  and message.reply_to_message is not None)
-async def responder_pregunta(message: Message):
-    # Obtén el ID del mensaje al que se está respondiendo (el mensaje que el bot envió al admin)
-    admin_msg_id = message.reply_to_message.message_id
-
-    if admin_msg_id in pregunta_mapping:
-        user_id = pregunta_mapping[admin_msg_id] # Obtenemos el ID del usuario original
-        # Enviar la respuesta del administrador al usuario correspondiente
-        try:
-            await bot.send_message(
-                user_id,
-                f"📝 **Respuesta del Administrador**:\n\n{message.text}\n\n¡Gracias por tu paciencia! 😎"
+@router.message(F.text == "Perfil")
+async def cmd_profile(message: Message):
+    async for session in get_db():
+        user = await session.get(User, message.from_user.id)
+        if user:
+            profile_text = (
+                f"👤 Perfil de @{user.username or user.telegram_id}\n"
+                f"📊 Puntos: {user.points}\n"
+                f"🏆 Nivel: {user.level}\n"
+                f"🎖 Logros: {', '.join(user.achievements) or 'Ninguno'}"
             )
-            await message.reply("✅ ¡Tu respuesta ha sido enviada al usuario con éxito! ✨")
-            # Eliminar la entrada del diccionario para evitar que crezca indefinidamente
-            del pregunta_mapping[admin_msg_id]
-        except Exception as e:
-             logging.error(f"Error al enviar respuesta a user {user_id} para admin_msg {admin_msg_id}: {e}")
-             await message.reply("❌ **Error**: No se pudo enviar la respuesta al usuario. 🤔")
-    else:
-        await message.reply("❌ **Error**: No se encontró la pregunta asociada a esta respuesta o ya fue respondida. 🤔")
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
+            ])
+            await message.answer(profile_text, reply_markup=keyboard)
+        else:
+            await message.answer("Por favor, usa /start primero.")
 
+@router.message(F.text == "Misiones")
+async def show_missions(message: Message):
+    async for session in get_db():
+        missions = await session.execute(select(Mission).filter_by(active=1))
+        missions = missions.scalars().all()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
+            for mission in missions
+        ])
+        await message.answer("Misiones disponibles:", reply_markup=keyboard)
 
-# >>> HANDLER PARA REVELAR ID <<<
-# No necesita cambios en su lógica interna de búsqueda
-@dp.message_handler(commands=['revelar_id'])
-async def revelar_id(message: types.Message):
-    # Solo permitir que el ADMIN_ID use este comando
-    if message.from_user.id == ADMIN_ID:
-        try:
-            # Extraer el ID del mensaje *enviado al admin* de los argumentos del comando
-            args = message.get_args().split()
-            if not args:
-                await message.reply("Uso: `/revelar_id <ID del mensaje que el bot te envió>`")
-                return
-
-            admin_msg_id_a_revelar = int(args[0])
-
-            # Buscar el ID del usuario en el diccionario usando el ID del mensaje que el bot envió al admin
-            user_id = pregunta_mapping.get(admin_msg_id_a_revelar)
-
-            if user_id:
-                # >>> Obtener información del usuario <<<
-                try:
-                    chat = await bot.get_chat(user_id) # Usamos get_chat con el user_id para obtener info del usuario
-                    username = chat.username # Obtener el nombre de usuario (si lo tiene)
-                    first_name = chat.first_name # Obtener el nombre
-                    last_name = chat.last_name # Obtener el apellido
-                    full_name = f"{first_name} {last_name}" if last_name else first_name # Combinar nombre y apellido si existe
-
-                    respuesta = (
-                        f"👤 **Información del Usuario** (Pregunta asociada al mensaje del admin ID `{admin_msg_id_a_revelar}`):\n\n"
-                    )
-                    if username:
-                        respuesta += f"**Nombre de usuario:** @{username}\n"
-                    respuesta += f"**Nombre completo:** {full_name}\n"
-                    respuesta += f"**ID de usuario:** `{user_id}`" # Mostrar ID del usuario en formato code
-
-                    await message.reply(respuesta, parse_mode='Markdown')
-                except Exception as e:
-                    logging.error(f"Error al obtener info del usuario {user_id} para revelar ID: {e}")
-                    await message.reply(f"Se encontró el usuario (ID: `{user_id}`) pero ocurrió un error al obtener su información completa.")
-
+@router.callback_query(F.data.startswith("mission_"))
+async def handle_mission(callback: CallbackQuery):
+    mission_id = int(callback.data.split("_")[1])
+    async for session in get_db():
+        mission = await session.get(Mission, mission_id)
+        user = await session.get(User, callback.from_user.id)
+        if mission and user:
+            if mission_id not in user.completed_missions:
+                user.points += mission.points
+                user.completed_missions.append(mission_id)
+                await award_achievement(user, "Primera Misión Completada", session)
+                await session.commit()
+                level_up = await check_level_up(user, session)
+                msg = f"¡Misión completada! Ganaste {mission.points} puntos."
+                if level_up:
+                    msg += f"\n¡Subiste al nivel {user.level}!"
+                await callback.message.answer(msg)
             else:
-                await message.reply(f"No se encontró el ID del usuario asociado al mensaje del admin ID `{admin_msg_id_a_revelar}` en el registro activo. La pregunta podría haber sido respondida ya o el ID es incorrecto.")
+                await callback.message.answer("Ya completaste esta misión.")
+        await callback.answer()
 
-        except ValueError:
-            await message.reply("Uso incorrecto. Uso: `/revelar_id <ID del mensaje que el bot te envió>`")
-        except Exception as e:
-            logging.error(f"Error general en handler revelar_id: {e}")
-            await message.reply("Ocurrió un error al procesar tu solicitud.")
-    else:
-        # Si alguien que no es el admin intenta usar el comando
-        await message.reply("No tienes permiso para usar este comando.")
+@router.message(F.text == "Tienda")
+async def show_store(message: Message):
+    async for session in get_db():
+        rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
+        rewards = rewards.scalars().all()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
+            for r in rewards
+        ])
+        await message.answer("Tienda de recompensas:", reply_markup=keyboard)
 
+@router.callback_query(F.data.startswith("reward_"))
+async def handle_reward(callback: CallbackQuery):
+    reward_id = int(callback.data.split("_")[1])
+    async for session in get_db():
+        reward = await session.get(Reward, reward_id)
+        user = await session.get(User, callback.from_user.id)
+        if reward and user and reward.stock > 0:
+            if user.points >= reward.cost:
+                user.points -= reward.cost
+                reward.stock -= 1
+                await session.commit()
+                await callback.message.answer(f"¡Canjeaste {reward.name}!")
+            else:
+                await callback.message.answer("No tienes suficientes puntos.")
+        else:
+            await callback.message.answer("Recompensa no disponible.")
+        await callback.answer()
 
-# >>> HANDLER PARA EL COMANDO /help <<<
-# No necesita cambios
-@dp.message_handler(commands=['help'])
-async def admin_help(message: types.Message):
-    # Solo permitir que el ADMIN_ID use este comando
-    if message.from_user.id == ADMIN_ID:
-        help_text = (
-            "📚 **Comandos y Funcionalidades del Administrador:**\n\n"
-            "✅ **Responder a un usuario:**\n"
-            "   Simplemente **responde al mensaje** de la pregunta que el bot te envió (usando la función 'Responder' de Telegram). Tu respuesta será enviada anónimamente al usuario original.\n\n"
-            "🕵️ **Revelar identidad:**\n"
-            "   Usa el comando `/revelar_id <ID del mensaje>`.\n"
-            "   Donde `<ID del mensaje>` es el número `ID Mensaje Bot` que aparece en el mensaje de la pregunta que el bot te envió. Esto revelará el nombre de usuario, nombre completo y ID del usuario que envió esa pregunta.\n\n"
-            "❓ **Ayuda:**\n"
-            "   Usa el comando `/help` para mostrar este menú.\n\n"
-            "*(Estos comandos solo funcionan en el chat privado con el bot)*"
+@router.message(F.text == "Ranking")
+async def show_ranking(message: Message):
+    async for session in get_db():
+        users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
+        users = users.scalars().all()
+        ranking_text = "🏆 Top 10 Jugadores:\n"
+        for i, user in enumerate(users, 1):
+            ranking_text += f"{i}. @{user.username or user.telegram_id} - {user.points} pts (Nivel {user.level})\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
+        ])
+        await message.answer(ranking_text, reply_markup=keyboard)
+
+@router.message(Command("exportar"))
+async def export_data(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    async for session in get_db():
+        users = await session.execute(select(User))
+        users = users.scalars().all()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["telegram_id", "username", "points", "level", "achievements"])
+        for user in users:
+            writer.writerow([user.telegram_id, user.username, user.points, user.level, user.achievements])
+        await message.answer_document(
+            document=io.BytesIO(output.getvalue().encode()),
+            filename="users_export.csv"
         )
-        await message.reply(help_text, parse_mode='Markdown')
-    else:
-        # Si un usuario normal usa /help
-         await message.reply("No tienes comandos de administrador disponibles.")
 
+@router.message(Command("resetear"))
+async def reset_season(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    async for session in get_db():
+        await session.execute("UPDATE users SET points = 0, level = 1, achievements = '[]', completed_missions = '[]'")
+        await session.commit()
+        await message.answer("Temporada reseteada.")
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
+    await callback.answer()
+
+# Inicialización y ejecución
+async def main():
+    await init_db()
+    dp.include_router(router)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
