@@ -1,562 +1,192 @@
-import os
-import logging
-import csv
-from datetime import datetime, timedelta
-from contextlib import suppress
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
-import sqlite3
 import asyncio
+import logging
+import os
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.utils import executor
+from aiogram.utils.exceptions import ChatNotFound # Importar excepción específica
 
-# Configuración inicial
+# Obtén los valores desde las variables de entorno
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+# >>> Variable de entorno para el ID del canal VIP <<<
+CHANNEL_ID = int(os.getenv("CHANNEL_ID")) # Asegúrate de que esta variable esté configurada en Railway
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
+
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-dp = Dispatcher()
 
-# Base de datos
-DB_NAME = "gamification.db"
+# Diccionario para mapear el ID del mensaje enviado al admin con el ID del usuario que hizo la pregunta
+# {admin_msg_id: user_id}
+pregunta_mapping = {}
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # Tabla de usuarios
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                 user_id INTEGER PRIMARY KEY,
-                 username TEXT,
-                 full_name TEXT,
-                 points INTEGER DEFAULT 0,
-                 level INTEGER DEFAULT 1,
-                 last_active DATE
-                 )''')
-    
-    # Tabla de logros
-    c.execute('''CREATE TABLE IF NOT EXISTS achievements (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT,
-                 description TEXT,
-                 icon TEXT
-                 )''')
-    
-    # Tabla de logros de usuarios
-    c.execute('''CREATE TABLE IF NOT EXISTS user_achievements (
-                 user_id INTEGER,
-                 achievement_id INTEGER,
-                 unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                 FOREIGN KEY(user_id) REFERENCES users(user_id),
-                 FOREIGN KEY(achievement_id) REFERENCES achievements(id)
-                 )''')
-    
-    # Tabla de misiones
-    c.execute('''CREATE TABLE IF NOT EXISTS missions (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT,
-                 description TEXT,
-                 points INTEGER,
-                 type TEXT,  -- daily/weekly
-                 cooldown_hours INTEGER
-                 )''')
-    
-    # Tabla de misiones completadas
-    c.execute('''CREATE TABLE IF NOT EXISTS completed_missions (
-                 user_id INTEGER,
-                 mission_id INTEGER,
-                 completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                 FOREIGN KEY(user_id) REFERENCES users(user_id),
-                 FOREIGN KEY(mission_id) REFERENCES missions(id)
-                 )''')
-    
-    # Tabla de tienda
-    c.execute('''CREATE TABLE IF NOT EXISTS shop (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT,
-                 description TEXT,
-                 cost INTEGER,
-                 stock INTEGER DEFAULT -1  -- -1 = ilimitado
-                 )''')
-    
-    # Tabla de eventos
-    c.execute('''CREATE TABLE IF NOT EXISTS events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT,
-                 description TEXT,
-                 multiplier REAL DEFAULT 1.0,
-                 active BOOLEAN DEFAULT 0,
-                 start_time TIMESTAMP,
-                 end_time TIMESTAMP
-                 )''')
-    
-    # Insertar logros iniciales
-    initial_achievements = [
-        ("Primeros Pasos", "Completa tu primera misión", "🚀"),
-        ("Nivel 5", "Alcanza el nivel 5", "⭐"),
-        ("Comprometido", "Participa 3 días seguidos", "🔥"),
-        ("Coleccionista", "Desbloquea 5 logros", "🏆"),
-        ("Maestro de Trivias", "Responde correctamente 10 trivias", "🧠")
-    ]
-    
-    c.executemany('INSERT OR IGNORE INTO achievements (name, description, icon) VALUES (?, ?, ?)', initial_achievements)
-    
-    # Insertar misiones iniciales
-    initial_missions = [
-        ("Visita Diaria", "Haz clic en el post destacado", 5, "daily", 24),
-        ("Trivia Semanal", "Participa en la trivia de esta semana", 20, "weekly", 168),
-        ("Explorador", "Visita 3 secciones diferentes", 15, "daily", 24),
-        ("Comprador", "Adquiere un artículo en la tienda", 10, "weekly", 168),
-        ("Social", "Comparte el canal con un amigo", 25, "daily", 24)
-    ]
-    
-    c.executemany('INSERT OR IGNORE INTO missions (name, description, points, type, cooldown_hours) VALUES (?, ?, ?, ?, ?)', initial_missions)
-    
-    conn.commit()
-    conn.close()
+# Handler para recibir preguntas de usuarios (excluyendo al admin, el comando /start y otros comandos)
+@dp.message_handler(lambda message: message.chat.type == "private" and message.from_user.id != ADMIN_ID and message.text != "/start" and not message.text.startswith('/'))
+async def recibir_pregunta(message: Message):
+    user_id = message.from_user.id
+    channel_id = CHANNEL_ID
 
-init_db()
+    # --- Paso 1: Verificar Membresía ---
+    try:
+        chat_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        status = chat_member.status
 
-# Clase para manejar la base de datos
-class Database:
-    @staticmethod
-    def get_connection():
-        return sqlite3.connect(DB_NAME)
-    
-    @staticmethod
-    def get_user(user_id: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        user = c.fetchone()
-        conn.close()
-        return user
-    
-    @staticmethod
-    def create_user(user: types.User):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
-                  (user.id, user.username, user.full_name))
-        conn.commit()
-        conn.close()
-    
-    @staticmethod
-    def update_user_points(user_id: int, points: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
-        
-        # Verificar si subió de nivel
-        user = Database.get_user(user_id)
-        if user:
-            new_level = Database.calculate_level(user[3] + points)
-            if new_level > user[4]:
-                c.execute("UPDATE users SET level = ? WHERE user_id = ?", (new_level, user_id))
-                conn.commit()
-                conn.close()
-                return new_level
-        
-        conn.commit()
-        conn.close()
-        return False
-    
-    @staticmethod
-    def calculate_level(points: int):
-        # Fórmula de niveles: nivel^2 * 10
-        level = 1
-        while points >= (level ** 2) * 10:
-            level += 1
-        return level
-    
-    @staticmethod
-    def get_achievements(user_id: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute('''SELECT a.id, a.name, a.description, a.icon 
-                     FROM user_achievements ua
-                     JOIN achievements a ON ua.achievement_id = a.id
-                     WHERE ua.user_id = ?''', (user_id,))
-        achievements = c.fetchall()
-        conn.close()
-        return achievements
-    
-    @staticmethod
-    def unlock_achievement(user_id: int, achievement_name: str):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT id FROM achievements WHERE name = ?", (achievement_name,))
-        achievement = c.fetchone()
-        
-        if achievement:
-            achievement_id = achievement[0]
-            # Verificar si ya lo tiene
-            c.execute("SELECT * FROM user_achievements WHERE user_id = ? AND achievement_id = ?", 
-                      (user_id, achievement_id))
-            if not c.fetchone():
-                c.execute("INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)",
-                          (user_id, achievement_id))
-                conn.commit()
-                conn.close()
-                return True
-        conn.close()
-        return False
-    
-    @staticmethod
-    def complete_mission(user_id: int, mission_id: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        
-        # Verificar si ya completó la misión recientemente
-        c.execute('''SELECT completed_at FROM completed_missions 
-                     WHERE user_id = ? AND mission_id = ? 
-                     ORDER BY completed_at DESC LIMIT 1''', (user_id, mission_id))
-        last_completion = c.fetchone()
-        
-        if last_completion:
-            last_time = datetime.strptime(last_completion[0], "%Y-%m-%d %H:%M:%S")
-            mission = Database.get_mission(mission_id)
-            if mission and (datetime.now() - last_time) < timedelta(hours=mission[4]):
-                conn.close()
-                return False
-        
-        # Registrar misión completada
-        c.execute("INSERT INTO completed_missions (user_id, mission_id) VALUES (?, ?)",
-                  (user_id, mission_id))
-        
-        # Obtener puntos de la misión
-        mission = Database.get_mission(mission_id)
-        if mission:
-            points = mission[3]
-            # Aplicar multiplicador de eventos activos
-            multiplier = Database.get_active_multiplier()
-            points = int(points * multiplier)
-            
-            # Actualizar puntos del usuario
-            Database.update_user_points(user_id, points)
-            
-            # Verificar logros
-            if mission_id == 1:  # Primera misión
-                Database.unlock_achievement(user_id, "Primeros Pasos")
-            
-            conn.commit()
-            conn.close()
-            return points
-        conn.close()
-        return 0
-    
-    @staticmethod
-    def get_mission(mission_id: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
-        mission = c.fetchone()
-        conn.close()
-        return mission
-    
-    @staticmethod
-    def get_active_missions(user_id: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        
-        # Obtener todas las misiones
-        c.execute("SELECT * FROM missions")
-        all_missions = c.fetchall()
-        
-        # Filtrar misiones disponibles
-        available_missions = []
-        for mission in all_missions:
-            mission_id = mission[0]
-            c.execute('''SELECT completed_at FROM completed_missions 
-                         WHERE user_id = ? AND mission_id = ?
-                         ORDER BY completed_at DESC LIMIT 1''', (user_id, mission_id))
-            last_completion = c.fetchone()
-            
-            if not last_completion:
-                available_missions.append(mission)
+        if status not in ['creator', 'administrator', 'member']:
+            await message.reply("⛔️ Lo siento, no estás registrado para usar este bot.")
+            return # Salir del handler si no es miembro
+
+    except ChatNotFound:
+        logging.error(f"El bot no puede encontrar el canal con ID {channel_id}. ¿Está configurado correctamente y el bot es miembro?")
+        await message.reply("❌ Ha ocurrido un error interno al verificar el canal. Por favor, informa al administrador.")
+        return # Salir si no se encuentra el canal
+
+    except Exception as e:
+        # Capturar cualquier otro error durante la verificación de membresía
+        logging.error(f"Error inesperado al verificar membresía del usuario {user_id}: {e}")
+        await message.reply("❌ Ha ocurrido un error al verificar tu estado. Por favor, intenta más tarde.")
+        return # Salir si ocurre otro error en la verificación
+
+
+    # --- Paso 2: Si es miembro, enviar mensaje al admin ---
+    # Este bloque solo se ejecuta si la verificación de membresía fue exitosa
+    try:
+        pregunta = message.text
+        sent_message = await bot.send_message(
+            ADMIN_ID,
+            f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*Procesando ID...*" # Enviamos un mensaje inicial sin el ID definitivo
+        )
+        # Una vez enviado, obtenemos su ID
+        admin_msg_id = sent_message.message_id
+
+        # Ahora editamos el mensaje para incluir su propio ID (el ID del mensaje que el bot envió al admin)
+        await bot.edit_message_text(
+             chat_id=ADMIN_ID,
+             message_id=admin_msg_id,
+             text=f"📩 **Nueva Pregunta Anónima**:\n\n{pregunta}\n\n*ID Mensaje Bot:* `{admin_msg_id}`\n\nPara responder, toca la opción de abajo. ¡Gracias! 👇",
+             parse_mode='Markdown'
+        )
+
+        # Almacenar en el diccionario {ID_mensaje_bot_a_admin : ID_usuario_original}
+        pregunta_mapping[admin_msg_id] = user_id
+
+
+        # Confirmar al usuario
+        await message.reply("✅ ¡Tu pregunta ha sido enviada de forma anónima! El administrador te responderá pronto. 🙏")
+
+    except Exception as e:
+        # Capturar errores durante el envío o edición del mensaje al admin o al actualizar el mapping
+        # En este punto, la membresía ya fue verificada.
+        logging.error(f"Error al enviar/editar mensaje al admin o actualizar mapping para user {user_id}: {e}")
+        await message.reply("❌ Ha ocurrido un error al procesar o enviar tu pregunta. Por favor, informa al administrador.")
+        # No salimos con return aquí para que el primer reply al usuario (si se ejecutó antes del error) no se pierda,
+        # aunque si el error ocurre *antes* del primer reply, el usuario podría no recibir confirmación ni error.
+        # La confirmación al usuario está ahora DESPUÉS del envío y edición al admin, así que si falla antes, no la recibe.
+        # Esto es mejor: solo confirma si la operación al admin fue exitosa.
+
+
+# Handler para que el administrador responda (usando la función de "responder" de Telegram)
+# No necesita cambios
+@dp.message_handler(lambda message: message.chat.type == "private"
+                                  and message.from_user.id == ADMIN_ID
+                                  and message.reply_to_message is not None)
+async def responder_pregunta(message: Message):
+    # Obtén el ID del mensaje al que se está respondiendo (el mensaje que el bot envió al admin)
+    admin_msg_id = message.reply_to_message.message_id
+
+    if admin_msg_id in pregunta_mapping:
+        user_id = pregunta_mapping[admin_msg_id] # Obtenemos el ID del usuario original
+        # Enviar la respuesta del administrador al usuario correspondiente
+        try:
+            await bot.send_message(
+                user_id,
+                f"📝 **Respuesta del Administrador**:\n\n{message.text}\n\n¡Gracias por tu paciencia! 😎"
+            )
+            await message.reply("✅ ¡Tu respuesta ha sido enviada al usuario con éxito! ✨")
+            # Eliminar la entrada del diccionario para evitar que crezca indefinidamente
+            del pregunta_mapping[admin_msg_id]
+        except Exception as e:
+             logging.error(f"Error al enviar respuesta a user {user_id} para admin_msg {admin_msg_id}: {e}")
+             await message.reply("❌ **Error**: No se pudo enviar la respuesta al usuario. 🤔")
+    else:
+        await message.reply("❌ **Error**: No se encontró la pregunta asociada a esta respuesta o ya fue respondida. 🤔")
+
+
+# >>> HANDLER PARA REVELAR ID <<<
+# No necesita cambios en su lógica interna de búsqueda
+@dp.message_handler(commands=['revelar_id'])
+async def revelar_id(message: types.Message):
+    # Solo permitir que el ADMIN_ID use este comando
+    if message.from_user.id == ADMIN_ID:
+        try:
+            # Extraer el ID del mensaje *enviado al admin* de los argumentos del comando
+            args = message.get_args().split()
+            if not args:
+                await message.reply("Uso: `/revelar_id <ID del mensaje que el bot te envió>`")
+                return
+
+            admin_msg_id_a_revelar = int(args[0])
+
+            # Buscar el ID del usuario en el diccionario usando el ID del mensaje que el bot envió al admin
+            user_id = pregunta_mapping.get(admin_msg_id_a_revelar)
+
+            if user_id:
+                # >>> Obtener información del usuario <<<
+                try:
+                    chat = await bot.get_chat(user_id) # Usamos get_chat con el user_id para obtener info del usuario
+                    username = chat.username # Obtener el nombre de usuario (si lo tiene)
+                    first_name = chat.first_name # Obtener el nombre
+                    last_name = chat.last_name # Obtener el apellido
+                    full_name = f"{first_name} {last_name}" if last_name else first_name # Combinar nombre y apellido si existe
+
+                    respuesta = (
+                        f"👤 **Información del Usuario** (Pregunta asociada al mensaje del admin ID `{admin_msg_id_a_revelar}`):\n\n"
+                    )
+                    if username:
+                        respuesta += f"**Nombre de usuario:** @{username}\n"
+                    respuesta += f"**Nombre completo:** {full_name}\n"
+                    respuesta += f"**ID de usuario:** `{user_id}`" # Mostrar ID del usuario en formato code
+
+                    await message.reply(respuesta, parse_mode='Markdown')
+                except Exception as e:
+                    logging.error(f"Error al obtener info del usuario {user_id} para revelar ID: {e}")
+                    await message.reply(f"Se encontró el usuario (ID: `{user_id}`) pero ocurrió un error al obtener su información completa.")
+
             else:
-                last_time = datetime.strptime(last_completion[0], "%Y-%m-%d %H:%M:%S")
-                cooldown = timedelta(hours=mission[5])
-                if (datetime.now() - last_time) > cooldown:
-                    available_missions.append(mission)
-        
-        conn.close()
-        return available_missions
-    
-    @staticmethod
-    def get_shop_items():
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT * FROM shop")
-        items = c.fetchall()
-        conn.close()
-        return items
-    
-    @staticmethod
-    def create_shop_item(name: str, description: str, cost: int, stock: int = -1):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("INSERT INTO shop (name, description, cost, stock) VALUES (?, ?, ?, ?)",
-                  (name, description, cost, stock))
-        conn.commit()
-        conn.close()
-    
-    @staticmethod
-    def create_event(name: str, description: str, multiplier: float, hours: int):
-        conn = Database.get_connection()
-        c = conn.cursor()
-        now = datetime.now()
-        end_time = now + timedelta(hours=hours)
-        
-        # Desactivar eventos anteriores
-        c.execute("UPDATE events SET active = 0")
-        
-        # Crear nuevo evento
-        c.execute('''INSERT INTO events (name, description, multiplier, active, start_time, end_time)
-                     VALUES (?, ?, ?, 1, ?, ?)''',
-                  (name, description, multiplier, now.strftime("%Y-%m-%d %H:%M:%S"), 
-                   end_time.strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-        conn.close()
-    
-    @staticmethod
-    def get_active_multiplier():
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT multiplier FROM events WHERE active = 1 AND end_time > CURRENT_TIMESTAMP")
-        event = c.fetchone()
-        conn.close()
-        return event[0] if event else 1.0
-    
-    @staticmethod
-    def get_ranking():
-        conn = Database.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT user_id, username, points, level FROM users ORDER BY points DESC LIMIT 10")
-        ranking = c.fetchall()
-        conn.close()
-        return ranking
-    
-    @staticmethod
-    def reset_season():
-        conn = Database.get_connection()
-        c = conn.cursor()
-        
-        # Guardar historial
-        c.execute('''CREATE TABLE IF NOT EXISTS season_history AS
-                     SELECT user_id, username, points, level, datetime('now') AS reset_date
-                     FROM users''')
-        
-        # Resetear puntos y niveles
-        c.execute("UPDATE users SET points = 0, level = 1")
-        
-        # Limpiar misiones completadas
-        c.execute("DELETE FROM completed_missions")
-        
-        conn.commit()
-        conn.close()
-    
-    @staticmethod
-    def export_data():
-        filename = "user_data.csv"
-        conn = Database.get_connection()
-        
-        # Exportar usuarios
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            c = conn.cursor()
-            c.execute("SELECT * FROM users")
-            writer.writerow([i[0] for i in c.description])
-            writer.writerows(c.fetchall())
-        
-        conn.close()
-        return filename
+                await message.reply(f"No se encontró el ID del usuario asociado al mensaje del admin ID `{admin_msg_id_a_revelar}` en el registro activo. La pregunta podría haber sido respondida ya o el ID es incorrecto.")
 
-# ======================
-# HANDLERS PRINCIPALES
-# ======================
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    Database.create_user(message.from_user)
-    await show_main_menu(message)
-
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    await show_main_menu(message)
-
-async def show_main_menu(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="👤 Perfil", callback_data="profile"),
-        InlineKeyboardButton(text="📋 Misiones", callback_data="missions")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🏪 Tienda", callback_data="shop"),
-        InlineKeyboardButton(text="🏆 Ranking", callback_data="ranking")
-    )
-    
-    await message.answer(
-        "🎮 Bienvenido al Sistema de Gamificación\n"
-        "Elige una opción del menú:",
-        reply_markup=builder.as_markup()
-    )
-
-# ======================
-# PERFIL DE USUARIO
-# ======================
-
-@dp.callback_query(F.data == "profile"))
-async def show_profile(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    user = Database.get_user(user_id)
-    
-    if not user:
-        await callback.answer("Usuario no encontrado")
-        return
-    
-    points = user[3]
-    level = user[4]
-    achievements = Database.get_achievements(user_id)
-    
-    # Calcular progreso al siguiente nivel
-    current_level_points = (level ** 2) * 10
-    next_level_points = ((level + 1) ** 2) * 10
-    progress = min(100, int((points - current_level_points) / (next_level_points - current_level_points) * 100))
-    
-    # Construir texto del perfil
-    text = (
-        f"👤 *Perfil de {callback.from_user.full_name}*\n\n"
-        f"⭐ *Puntos:* `{points}`\n"
-        f"🚀 *Nivel:* `{level}`\n"
-        f"📊 *Progreso:* `{progress}%`\n\n"
-        f"🏆 *Logros:* `{len(achievements)}/20`"
-    )
-    
-    # Construir logros
-    achievements_text = "\n".join([f"{a[3]} {a[1]}" for a in achievements[:3]])
-    if achievements_text:
-        text += f"\n\n{achievements_text}"
-    
-    # Botones
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="Ver Todos los Logros", callback_data="all_achievements"),
-        InlineKeyboardButton(text="Misiones Activas", callback_data="missions")
-    )
-    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-# ======================
-# SISTEMA DE MISIONES
-# ======================
-
-@dp.callback_query(F.data == "missions"))
-async def show_missions(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    missions = Database.get_active_missions(user_id)
-    
-    if not missions:
-        text = "🎯 No tienes misiones disponibles en este momento"
+        except ValueError:
+            await message.reply("Uso incorrecto. Uso: `/revelar_id <ID del mensaje que el bot te envió>`")
+        except Exception as e:
+            logging.error(f"Error general en handler revelar_id: {e}")
+            await message.reply("Ocurrió un error al procesar tu solicitud.")
     else:
-        text = "🎯 *Misiones Activas*\n\n"
-        for mission in missions:
-            text += f"• {mission[1]} - `+{mission[3]} puntos`\n{mission[2]}\n\n"
-    
-    builder = InlineKeyboardBuilder()
-    for mission in missions[:3]:  # Mostrar máximo 3 misiones
-        builder.row(InlineKeyboardButton(
-            text=f"✅ Completar: {mission[1]}",
-            callback_data=f"complete_mission:{mission[0]}"
-        ))
-    
-    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        # Si alguien que no es el admin intenta usar el comando
+        await message.reply("No tienes permiso para usar este comando.")
 
-@dp.callback_query(F.data.startswith("complete_mission:"))
-async def complete_mission(callback: types.CallbackQuery):
-    mission_id = int(callback.data.split(":")[1])
-    user_id = callback.from_user.id
-    points_earned = Database.complete_mission(user_id, mission_id)
-    
-    if points_earned:
-        # Verificar si desbloqueó algún logro
-        user = Database.get_user(user_id)
-        if user and user[4] >= 5:
-            Database.unlock_achievement(user_id, "Nivel 5")
-        
-        await callback.answer(f"✅ ¡Misión completada! +{points_earned} puntos", show_alert=True)
-        await show_missions(callback)
+
+# >>> HANDLER PARA EL COMANDO /help <<<
+# No necesita cambios
+@dp.message_handler(commands=['help'])
+async def admin_help(message: types.Message):
+    # Solo permitir que el ADMIN_ID use este comando
+    if message.from_user.id == ADMIN_ID:
+        help_text = (
+            "📚 **Comandos y Funcionalidades del Administrador:**\n\n"
+            "✅ **Responder a un usuario:**\n"
+            "   Simplemente **responde al mensaje** de la pregunta que el bot te envió (usando la función 'Responder' de Telegram). Tu respuesta será enviada anónimamente al usuario original.\n\n"
+            "🕵️ **Revelar identidad:**\n"
+            "   Usa el comando `/revelar_id <ID del mensaje>`.\n"
+            "   Donde `<ID del mensaje>` es el número `ID Mensaje Bot` que aparece en el mensaje de la pregunta que el bot te envió. Esto revelará el nombre de usuario, nombre completo y ID del usuario que envió esa pregunta.\n\n"
+            "❓ **Ayuda:**\n"
+            "   Usa el comando `/help` para mostrar este menú.\n\n"
+            "*(Estos comandos solo funcionan en el chat privado con el bot)*"
+        )
+        await message.reply(help_text, parse_mode='Markdown')
     else:
-        await callback.answer("⏳ Esta misión no está disponible todavía", show_alert=True)
+        # Si un usuario normal usa /help
+         await message.reply("No tienes comandos de administrador disponibles.")
 
-# ======================
-# TIENDA DE RECOMPENSAS
-# ======================
 
-@dp.callback_query(F.data == "shop"))
-async def show_shop(callback: types.CallbackQuery):
-    items = Database.get_shop_items()
-    
-    if not items:
-        text = "🏪 La tienda está vacía por ahora"
-    else:
-        text = "🏪 *Tienda de Recompensas*\n\n"
-        for item in items:
-            text += f"• *{item[1]}* - `{item[3]} puntos`\n{item[2]}\n\n"
-    
-    builder = InlineKeyboardBuilder()
-    for item in items[:3]:  # Mostrar máximo 3 ítems
-        builder.row(InlineKeyboardButton(
-            text=f"🛒 Canjear: {item[1]}",
-            callback_data=f"redeem:{item[0]}"
-        ))
-    
-    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-# ======================
-# RANKING DE USUARIOS
-# ======================
-
-@dp.callback_query(F.data == "ranking"))
-async def show_ranking(callback: types.CallbackQuery):
-    ranking = Database.get_ranking()
-    
-    if not ranking:
-        text = "🏆 Todavía no hay datos para mostrar el ranking"
-    else:
-        text = "🏆 *Top 10 Jugadores*\n\n"
-        for i, player in enumerate(ranking, 1):
-            username = player[1] or f"Usuario {player[0]}"
-            text += f"{i}. {username} - `{player[2]} puntos` (Nvl {player[3]})\n"
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔄 Actualizar", callback_data="ranking"))
-    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-# ======================
-# PANEL DE ADMINISTRACIÓN
-# ======================
-
-@dp.message(Command("admin"))
-async def admin_panel(message: types.Message):
-    if message.from_user.id != int(os.getenv("ADMIN_ID")):
-        await message.answer("⛔ Acceso denegado")
-        return
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✨ Activar Evento", callback_data="activate_event"),
-        InlineKeyboardButton(text="🎁 Crear Recompensa", callback_data="create_reward")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔄 Resetear Temporada", callback_data="reset_season"),
-        InlineKeyboardButton(text="📤 Exportar Datos", callback_data="export_data")
-    )
-    
-    await message.ans
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
